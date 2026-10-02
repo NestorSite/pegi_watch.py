@@ -2,7 +2,7 @@ name: Vigilante PEGI GTA VI
 
 on:
   schedule:
-    - cron: "17 */3 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       test:
