@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Alerta para cuando aparezca GTA VI en la base de datos de PEGI.
 
-Dos vigilancias:
+Vigilancias:
   1. Web de PEGI: avisa si aparece "Grand Theft Auto VI" (o "6") o si el
      numero de resultados sube por encima del ultimo conocido (base: 51).
   2. Google News (opcional): avisa de noticias nuevas que mencionen PEGI y
      GTA VI, como pista temprana.
 
-Ademas avisa si la web falla varias veces seguidas, para que el silencio
-nunca signifique "se ha roto y no me he enterado".
+Si PEGI falla varias veces seguidas, avisa una vez y reduce el ritmo de
+peticiones (reintenta cada hora) hasta que se recupere.
 
 Uso:
   python pegi_watch.py          # ejecucion normal
@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -27,6 +28,7 @@ PEGI_URL = "https://pegi.info/es/search-pegi?q=Grand+Theft+Auto"
 NEWS_URL = "https://news.google.com/rss/search?q=GTA+VI+PEGI&hl=es&gl=ES&ceid=ES:es"
 BASELINE_COUNT = 51
 FAILS_BEFORE_WARNING = 3
+BACKOFF_SECONDS = 3600
 
 STATE_FILE = Path("state.json")
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
@@ -69,7 +71,24 @@ def notify(message):
         print(f"No se pudo enviar a Discord: {exc}")
 
 
+def describe_response(r):
+    text = r.text
+    m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+    title = re.sub(r"\s+", " ", m.group(1)).strip() if m else "sin titulo"
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = re.sub(r"\s+", " ", plain).strip()[:200]
+    return f"HTTP {r.status_code}, {len(text)} bytes, titulo='{title}', inicio='{plain}'"
+
+
 def check_pegi(state):
+    fails = state.get("fail_count", 0)
+    now = time.time()
+    if fails >= FAILS_BEFORE_WARNING and now - state.get("last_attempt", 0) < BACKOFF_SECONDS:
+        print("PEGI: en pausa por fallos seguidos, se reintentara mas tarde")
+        return
+    state["last_attempt"] = now
+
+    r = None
     try:
         r = requests.get(PEGI_URL, headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -77,22 +96,29 @@ def check_pegi(state):
         if "grand theft auto" not in html.lower():
             raise ValueError("La pagina no contiene 'Grand Theft Auto'; puede haber cambiado el formato o haber un bloqueo")
     except (requests.RequestException, ValueError) as exc:
-        state["fail_count"] = state.get("fail_count", 0) + 1
+        state["fail_count"] = fails + 1
         print(f"Fallo leyendo PEGI ({state['fail_count']}): {exc}")
+        detail = ""
+        if r is not None:
+            detail = describe_response(r)
+            print(f"Detalle: {detail}")
         if state["fail_count"] == FAILS_BEFORE_WARNING:
             notify(
                 f"⚠️ El vigilante de PEGI lleva {FAILS_BEFORE_WARNING} fallos seguidos "
-                f"y no puede leer la web. Ultimo error: {exc}"
+                f"y no puede leer la web. Reintentara cada hora.\n"
+                f"Ultimo error: {exc}\n{detail[:300]}"
             )
         return
 
+    if fails >= FAILS_BEFORE_WARNING:
+        notify("✅ El vigilante de PEGI vuelve a leer la web con normalidad.")
     state["fail_count"] = 0
 
     match = COUNT_RE.search(html)
     count = int(match.group(1)) if match else None
     found_vi = bool(GTA6_RE.search(html))
     last_count = state.get("last_count", BASELINE_COUNT)
-    print(f"PEGI: resultados={count} (ultimo conocido={last_count}), GTA VI en el texto={found_vi}")
+    print(f"PEGI: resultados={count} (ultimo conocido={last_count}), Grand Theft Auto VI en el texto={found_vi}")
 
     if found_vi and not state.get("pegi_vi_found"):
         state["pegi_vi_found"] = True
